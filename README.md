@@ -219,20 +219,3 @@ vercel
 7. **Metrics** — track reservation-to-confirm conversion rate, expiry rate, 409 rate per product.
 
 ---
-
-## Interview Debrief Preparation
-
-**Q: Why SELECT FOR UPDATE instead of application-level locking?**
-Application-level locks (mutexes, Redis SETNX) don't survive process crashes or horizontal scaling. PostgreSQL row locks are tied to the transaction — they're automatically released on crash/disconnect. They also compose correctly with other DB operations in the same transaction.
-
-**Q: What happens if the server crashes mid-transaction?**
-PostgreSQL rolls back any uncommitted transaction automatically. The inventory row is never partially updated. The reservation is never created in a half-state. This is the fundamental guarantee of ACID transactions.
-
-**Q: How does the expiry job handle the confirm-vs-expiry race?**
-Both the confirm endpoint and the expiry job use `UPDATE ... WHERE status = 'PENDING'`. Only one can match — the other gets 0 rows back and handles it gracefully. No distributed lock needed.
-
-**Q: Why not use a DB trigger for expiry?**
-Triggers run synchronously on every write to the table, adding latency to every reservation operation. A cron job runs asynchronously and doesn't affect the hot path. The tradeoff is up to 1-minute delay in releasing expired stock — acceptable for most use cases.
-
-**Q: What's the bottleneck at scale?**
-The `FOR UPDATE` lock serializes all reservations for the same product+warehouse. At extreme scale (flash sales), this becomes a queue. Solutions: shard inventory by warehouse, use advisory locks with shorter critical sections, or pre-allocate reservation slots.
