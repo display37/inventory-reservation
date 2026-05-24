@@ -1,36 +1,238 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Inventory Reservation System
 
-## Getting Started
+A production-quality inventory reservation system built to prevent overselling during concurrent checkouts.
 
-First, run the development server:
+## The Core Problem
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+During checkout, payment takes time. Two naive approaches both fail:
+
+| Approach | Problem |
+|---|---|
+| Decrement stock only after payment | Two users see stock=1, both pay, both succeed → **overselling** |
+| Decrement stock immediately | Payment fails → stock is permanently lost → **inventory leak** |
+
+**Solution:** Temporary reservations. Stock is *reserved* (not decremented) during checkout. Reservations expire after 10 minutes. On payment success → confirmed + permanently decremented. On failure/expiry → released back to available.
+
+---
+
+## Architecture
+
+```
+src/
+├── app/
+│   ├── api/
+│   │   ├── products/route.ts          # GET /api/products
+│   │   ├── warehouses/route.ts        # GET /api/warehouses
+│   │   ├── reservations/
+│   │   │   ├── route.ts               # POST /api/reservations
+│   │   │   └── [id]/
+│   │   │       ├── confirm/route.ts   # POST /api/reservations/:id/confirm
+│   │   │       └── release/route.ts   # POST /api/reservations/:id/release
+│   │   └── cron/
+│   │       └── expire-reservations/route.ts
+│   └── page.tsx                       # Product listing + reservation UI
+├── services/
+│   └── reservation.service.ts         # ALL business logic lives here
+├── repositories/
+│   ├── inventory.repository.ts        # SELECT FOR UPDATE + inventory mutations
+│   ├── reservation.repository.ts      # Reservation CRUD
+│   └── product.repository.ts          # Product + warehouse reads
+├── lib/
+│   ├── prisma.ts                      # Singleton Prisma client
+│   ├── fetcher.ts                     # Typed SWR fetcher
+│   └── api-response.ts                # Consistent HTTP response helpers
+├── schemas/
+│   └── reservation.schema.ts          # Zod validation schemas
+├── hooks/
+│   ├── useProducts.ts                 # SWR polling hook
+│   └── useReservation.ts              # Reserve/confirm/release mutations
+├── components/
+│   ├── ProductCard.tsx
+│   ├── ReservationPanel.tsx
+│   ├── CountdownTimer.tsx
+│   └── ErrorAlert.tsx
+└── types/
+    └── index.ts                       # Shared domain types
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+**Layer rules:**
+- Route handlers → thin, only parse/validate/respond
+- Services → all business logic, transaction orchestration
+- Repositories → only DB access, no business logic
+- No layer skips (routes never call repositories directly)
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+---
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+## Concurrency Design
 
-## Learn More
+### The Race Condition
 
-To learn more about Next.js, take a look at the following resources:
+```
+T1: SELECT available=1  ✓
+T2: SELECT available=1  ✓  ← reads stale data before T1 commits
+T1: UPDATE reservedQty += 1, INSERT reservation
+T2: UPDATE reservedQty += 1, INSERT reservation  ← OVERSELL
+```
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+### The Fix: SELECT FOR UPDATE
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+```sql
+-- Inside a transaction:
+SELECT id, "totalQuantity", "reservedQuantity"
+FROM "Inventory"
+WHERE "productId" = $1 AND "warehouseId" = $2
+FOR UPDATE  -- acquires exclusive row lock
+```
 
-## Deploy on Vercel
+```
+T1: SELECT FOR UPDATE → acquires lock, available=1
+T2: SELECT FOR UPDATE → BLOCKS (waits)
+T1: UPDATE reservedQty += 1, INSERT reservation, COMMIT → releases lock
+T2: unblocks, re-reads → available=0 → returns 409 Conflict
+```
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+PostgreSQL guarantees that T2 sees T1's committed data after the lock is released. This is the only correct solution — no application-level locking, no Redis, no optimistic concurrency needed.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+### Why Not Optimistic Locking?
+
+Optimistic locking (version columns + retry) works well for low-contention scenarios. For inventory — especially flash sales — contention is *high by design*. Optimistic locking would cause a thundering herd of retries. Pessimistic locking (FOR UPDATE) serializes access cleanly.
+
+### Atomic Status Transitions
+
+Confirm and release use a conditional UPDATE:
+
+```sql
+UPDATE "Reservation"
+SET status = 'CONFIRMED', "confirmedAt" = NOW()
+WHERE id = $1 AND status = 'PENDING'  -- guard clause
+RETURNING *
+```
+
+If the reservation was already released by the expiry job, this matches 0 rows → the service detects the conflict and returns 409. This prevents double-confirm and confirm-vs-expiry races without any additional locking.
+
+### availableStock = totalQuantity - reservedQuantity
+
+Never stored separately. Storing it would require 3-way consistency (totalQuantity + reservedQuantity + availableQuantity) in every transaction — double the writes, double the failure surface. Computing it at read time from two source-of-truth fields is always consistent.
+
+---
+
+## API Reference
+
+| Method | Path | Description | Success | Error |
+|---|---|---|---|---|
+| GET | `/api/products` | List products with available stock | 200 | 500 |
+| GET | `/api/warehouses` | List warehouses | 200 | 500 |
+| POST | `/api/reservations` | Create reservation | 201 | 409 (no stock), 400 (invalid) |
+| POST | `/api/reservations/:id/confirm` | Confirm reservation | 200 | 409 (finalized), 410 (expired), 404 |
+| POST | `/api/reservations/:id/release` | Release reservation | 200 | 409 (finalized), 404 |
+| GET | `/api/cron/expire-reservations` | Cleanup expired (cron) | 200 | 401 |
+
+### Error Response Shape
+
+```json
+{
+  "error": {
+    "code": "INSUFFICIENT_STOCK",
+    "message": "Only 0 unit(s) available, requested 1."
+  }
+}
+```
+
+---
+
+## Local Setup
+
+### Prerequisites
+- Node.js 18+
+- PostgreSQL 14+
+
+### Steps
+
+```bash
+# 1. Clone and install
+git clone <repo>
+cd inventory-reservation
+npm install
+
+# 2. Configure environment
+cp .env.example .env
+# Edit .env — set DATABASE_URL with your PostgreSQL credentials
+
+# 3. Create database
+psql -U postgres -c "CREATE DATABASE inventory_reservation;"
+
+# 4. Run migrations
+npm run db:migrate
+
+# 5. Seed data
+npm run db:seed
+
+# 6. Start dev server
+npm run dev
+```
+
+Open [http://localhost:3000](http://localhost:3000)
+
+---
+
+## Deployment (Vercel)
+
+```bash
+# Install Vercel CLI
+npm i -g vercel
+
+# Deploy
+vercel
+
+# Set environment variables in Vercel dashboard:
+# DATABASE_URL — your production PostgreSQL connection string
+# RESERVATION_EXPIRY_MINUTES — 10
+# CRON_SECRET — a strong random secret
+```
+
+`vercel.json` configures the cron job to run every minute automatically.
+
+**Important:** Use a connection pooler (PgBouncer / Supabase pooler) in production. Serverless functions create a new DB connection per invocation — without pooling you'll exhaust PostgreSQL's connection limit quickly.
+
+---
+
+## Tradeoffs & Decisions
+
+| Decision | Chosen | Alternative | Why |
+|---|---|---|---|
+| Concurrency control | Pessimistic (FOR UPDATE) | Optimistic (version column) | High contention scenarios need serialization, not retries |
+| Available stock | Computed (total - reserved) | Stored column | Eliminates 3-way consistency problem |
+| Expiry mechanism | Cron job | DB triggers / event queue | Simpler, no additional infrastructure, good enough for 1-min granularity |
+| Idempotency | DB status guard (WHERE status=PENDING) | Redis idempotency keys | Fewer moving parts, same correctness guarantee |
+| Real-time updates | SWR polling (5s) | WebSockets / SSE | Sufficient for inventory use case, zero infrastructure |
+
+---
+
+## Future Improvements
+
+1. **Multi-item reservations** — reserve multiple products in one transaction. Requires consistent lock ordering (always lock by productId ASC) to prevent deadlocks.
+2. **User association** — add `userId` to reservations for per-user reservation limits.
+3. **Webhook notifications** — notify users when their reservation is about to expire.
+4. **Connection pooling** — add PgBouncer or use Supabase/Neon with built-in pooling for production serverless.
+5. **Reservation quantity > 1** — currently UI reserves 1 unit; extend form to allow quantity selection.
+6. **Audit log** — append-only event table for every status transition (useful for disputes).
+7. **Metrics** — track reservation-to-confirm conversion rate, expiry rate, 409 rate per product.
+
+---
+
+## Interview Debrief Preparation
+
+**Q: Why SELECT FOR UPDATE instead of application-level locking?**
+Application-level locks (mutexes, Redis SETNX) don't survive process crashes or horizontal scaling. PostgreSQL row locks are tied to the transaction — they're automatically released on crash/disconnect. They also compose correctly with other DB operations in the same transaction.
+
+**Q: What happens if the server crashes mid-transaction?**
+PostgreSQL rolls back any uncommitted transaction automatically. The inventory row is never partially updated. The reservation is never created in a half-state. This is the fundamental guarantee of ACID transactions.
+
+**Q: How does the expiry job handle the confirm-vs-expiry race?**
+Both the confirm endpoint and the expiry job use `UPDATE ... WHERE status = 'PENDING'`. Only one can match — the other gets 0 rows back and handles it gracefully. No distributed lock needed.
+
+**Q: Why not use a DB trigger for expiry?**
+Triggers run synchronously on every write to the table, adding latency to every reservation operation. A cron job runs asynchronously and doesn't affect the hot path. The tradeoff is up to 1-minute delay in releasing expired stock — acceptable for most use cases.
+
+**Q: What's the bottleneck at scale?**
+The `FOR UPDATE` lock serializes all reservations for the same product+warehouse. At extreme scale (flash sales), this becomes a queue. Solutions: shard inventory by warehouse, use advisory locks with shorter critical sections, or pre-allocate reservation slots.
